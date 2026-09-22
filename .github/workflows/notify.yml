@@ -23,8 +23,14 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      TZ: Europe/Moscow  # время в базе и в сообщениях — по Москве, как на Маке
     steps:
+      # Явная ветка, а не коммит события: следующий запуск ставится до коммита базы и настроек,
+      # и без ref он получил бы settings.json без последних команд из Telegram
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
 
       - uses: actions/cache/restore@v4
         with:
