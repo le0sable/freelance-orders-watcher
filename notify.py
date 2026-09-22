@@ -10,7 +10,8 @@
 По оценкам 👍/👎 считается 🎯 — насколько заказ похож на понравившиеся.
 
     python3 notify.py --setup <токен>  # один раз: сохранить токен и найти chat_id
-    python3 notify.py                  # один проход (его запускает GitHub Actions)
+    python3 notify.py                  # один проход
+    python3 notify.py --loop 540       # 9 минут: площадки раз в 3 мин, команды сразу (так в GitHub Actions)
     python3 notify.py --test 5         # прислать 5 последних подходящих заказов из базы
 
 Доступ к боту лежит в tg.json (или в TG_TOKEN / TG_CHAT_ID): token, chat_id и необязательный proxy — http-прокси
@@ -256,7 +257,7 @@ def tg(cfg, method, **params):
     opener = urllib.request.build_opener(*handlers)
     data = urllib.parse.urlencode(params).encode()
     url = f"https://api.telegram.org/bot{cfg['token']}/{method}"
-    with opener.open(url, data=data, timeout=30) as r:
+    with opener.open(url, data=data, timeout=30 + int(params.get('timeout', 0))) as r:
         return json.loads(r.read())
 
 
@@ -335,7 +336,8 @@ HELP = """Команды:
 /stats — сколько оценок 👍/👎 и заказов по нишам
 
 Кнопки 👍/👎 под заказами учат оценку 🎯: после 10 👍 и 10 👎 она появится в сообщениях.
-Бот проверяет команды раз в 10 минут, так что ответ придёт не сразу."""
+Бот отвечает сразу, пока идёт очередной запуск на GitHub, и с задержкой до 10–20 минут,
+если запуск ещё не начался."""
 
 
 def _rules_text(settings):
@@ -396,14 +398,15 @@ def handle_command(text, settings, con):
     return (HELP, False)
 
 
-def process_updates(cfg, settings, log):
-    """Забирает накопившиеся нажатия кнопок и команды. Возвращает True, если что-то изменилось."""
+def process_updates(cfg, settings, log, wait=0):
+    """Забирает нажатия кнопок и команды (ждёт до wait секунд, если их нет).
+    Возвращает True, если изменились настройки или оценки."""
     con = sqlite3.connect(collect.DB)
     con.executescript(collect.SCHEMA)
     row = con.execute("select value from kv where key='tg_offset'").fetchone()
     offset = int(row[0]) if row else 0
     try:
-        updates = tg(cfg, 'getUpdates', offset=offset, timeout=0)['result']
+        updates = tg(cfg, 'getUpdates', offset=offset, timeout=wait)['result']
     except Exception as e:
         log(f'  telegram getUpdates: ошибка {e!r}')
         return False
@@ -420,6 +423,10 @@ def process_updates(cfg, settings, log):
                         (source, oid, int(label), collect.now()))
             changed = True
             mark = '👍 отмечено' if label == '1' else '👎 отмечено'
+            try:
+                tg(cfg, 'answerCallbackQuery', callback_query_id=cb['id'], text=mark)
+            except Exception:
+                pass  # если ответить не успели (запрос устарел), просто меняем кнопки
             try:
                 tg(cfg, 'editMessageReplyMarkup', chat_id=chat, message_id=cb['message']['message_id'],
                    reply_markup=json.dumps({'inline_keyboard': [[{'text': mark, 'callback_data': 'noop'}]]}))
@@ -489,15 +496,8 @@ def test(cfg, n):
     print(f'отправлено {notify_orders(cfg, picked, settings, scorer)}')
 
 
-def run(cfg):
-    log = lambda s: print(s, flush=True)  # noqa: E731
-    log(f"=== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ===")
-    # Без базы все заказы выглядят новыми: первый проход только наполняет её, без уведомлений
-    silent = not os.path.exists(collect.DB)
-    if silent:
-        log('  базы нет — тихий проход, уведомления со следующего запуска')
-    settings = collect.load_settings()
-    changed = process_updates(cfg, settings, log)
+def collect_pass(cfg, settings, log, silent=False):
+    """Один проход по всем площадкам: сохранить новые заказы и прислать подходящие."""
     con = sqlite3.connect(collect.DB)
     con.executescript(collect.SCHEMA)
     known_sources = {r[0] for r in con.execute('select distinct source from orders')}
@@ -516,6 +516,29 @@ def run(cfg):
             log(f'  {name}: новых {len(new)}, первый проход — без уведомлений')
             continue
         log(f'  {name}: новых {len(new)}, отправлено {notify_orders(cfg, new, settings, scorer)}')
+
+
+def run(cfg, duration=0, every=180):
+    """Один проход, или (duration > 0) работа в течение duration секунд: площадки
+    опрашиваются раз в every секунд, а в паузах бот сразу отвечает на команды и кнопки."""
+    log = lambda s: print(s, flush=True)  # noqa: E731
+    log(f"=== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ===")
+    # Без базы все заказы выглядят новыми: первый проход только наполняет её, без уведомлений
+    silent = not os.path.exists(collect.DB)
+    if silent:
+        log('  базы нет — тихий проход, уведомления со следующего запуска')
+    settings = collect.load_settings()
+    changed = process_updates(cfg, settings, log)
+    collect_pass(cfg, settings, log, silent)
+    deadline = time.time() + duration
+    next_pass = time.time() + every
+    while time.time() < deadline - 5:
+        wait = int(max(1, min(25, next_pass - time.time(), deadline - time.time() - 5)))
+        changed |= process_updates(cfg, settings, log, wait=wait)
+        if time.time() >= next_pass and time.time() < deadline - 60:
+            log(f"--- {datetime.datetime.now():%H:%M:%S} ---")
+            collect_pass(cfg, settings, log)
+            next_pass = time.time() + every
     if changed:
         # сигнал для GitHub Actions: закоммитить настройки и базу с оценками
         open(os.path.join(HERE, '.changed'), 'w').close()
@@ -525,13 +548,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--setup', metavar='TOKEN')
     ap.add_argument('--test', type=int, metavar='N')
+    ap.add_argument('--loop', type=int, default=0, metavar='SECONDS',
+                    help='работать столько секунд: площадки раз в 3 мин, команды сразу')
     args = ap.parse_args()
     if args.setup:
         setup(args.setup)
     elif args.test:
         test(load_config(), args.test)
     else:
-        run(load_config())
+        run(load_config(), duration=args.loop)
 
 
 if __name__ == '__main__':
