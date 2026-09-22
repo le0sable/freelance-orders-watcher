@@ -25,7 +25,9 @@ jobs:
 
       - uses: actions/cache/restore@v4
         with:
-          path: market.db
+          path: |
+            market.db
+            kwork_categories.json
           key: market-db-${{ github.run_id }}
           restore-keys: market-db-
 
@@ -38,7 +40,9 @@ jobs:
       - uses: actions/cache/save@v4
         if: always()
         with:
-          path: market.db
+          path: |
+            market.db
+            kwork_categories.json
           key: market-db-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Сохранить в репозиторий (после команд и оценок из Telegram или раз в 6 часов)
@@ -51,7 +55,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add market.db settings.json
-          [ -f kwork_categories.json ] && git add kwork_categories.json
           git diff --cached --quiet && exit 0
           git commit -m "data: база заказов и настройки"
           git pull --rebase -X theirs && git push

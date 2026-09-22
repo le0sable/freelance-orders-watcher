@@ -3,3 +3,4 @@ tg.json
 __pycache__/
 local.freelance-notify.plist
 .changed
+kwork_categories.json
