@@ -2,7 +2,9 @@
 
 Kwork — вся лента со всеми страницами и полными полями (бюджет, срок,
 отклики, просмотры, % найма у заказчика). FL.ru и Freelance.ru — через
-источники в sources/ (взяты из github.com/IsWake77/FreelanceParser).
+источники в sources/ (взяты из github.com/IsWake77/FreelanceParser),
+pchel.net, freelancejob.ru и Telegram-каналы — sources/extra.py.
+Список Telegram-каналов — в settings.json.
 
 Каждый запуск дописывает новые заказы и снимок откликов/просмотров для уже
 известных, так что со временем видно, как быстро растёт конкуренция.
@@ -30,9 +32,10 @@ if sys.platform == 'darwin' and os.path.exists('/etc/ssl/cert.pem'):
     os.environ.setdefault('SSL_CERT_FILE', '/etc/ssl/cert.pem')
 
 from sources.base import HttpClient, HttpError  # noqa: E402
-from sources import flru, freelanceru  # noqa: E402
+from sources import extra, flru, freelanceru  # noqa: E402
 
 DB = os.path.join(HERE, 'market.db')
+SETTINGS = os.path.join(HERE, 'settings.json')
 KWORK_PAUSE = 12
 KWORK_BACKOFF = 120  # после 403 ждём и пробуем ещё раз
 
@@ -47,7 +50,22 @@ create table if not exists orders (
 create table if not exists snapshots (
     source text, id text, ts text, responses integer, views integer
 );
+create table if not exists feedback (
+    source text, id text, label integer, ts text, primary key (source, id)
+);
+create table if not exists kv (key text primary key, value text);
 """
+
+
+def load_settings():
+    with open(SETTINGS, encoding='utf-8') as f:
+        return json.load(f)
+
+
+def save_settings(settings):
+    with open(SETTINGS, 'w', encoding='utf-8') as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+        f.write('\n')
 
 
 def now():
@@ -188,6 +206,28 @@ def fetch_freelanceru(log):
     return orders
 
 
+def _simple(name, fn):
+    def run(log):
+        orders = fn()
+        log(f'  {name}: {len(orders)} заказов')
+        return orders
+    return run
+
+
+def all_sources(settings, full=False, kwork=True):
+    """[(название, функция(log) -> заказы)]; Kwork последним — он самый медленный."""
+    sources = [
+        ('fl.ru', fetch_flru),
+        ('freelance.ru', fetch_freelanceru),
+        ('freelancejob.ru', _simple('freelancejob.ru', extra.fetch_freelancejob)),
+        ('pchel.net', _simple('pchel.net', extra.fetch_pchel)),
+        ('telegram', _simple('telegram', lambda: extra.fetch_telegram(settings.get('telegram_channels', [])))),
+    ]
+    if kwork:
+        sources.append(('kwork', lambda log: fetch_kwork(log, full)))
+    return sources
+
+
 def save(orders):
     """Пишет заказы в базу. Возвращает (список новых заказов, всего в базе)."""
     ts = now()
@@ -224,10 +264,7 @@ def main():
     args = ap.parse_args()
     log = lambda s: print(s, flush=True)  # noqa: E731
     log(f'=== {now()} ===')
-    for name, fn in (('fl.ru', fetch_flru), ('freelance.ru', fetch_freelanceru),
-                     ('kwork', None if args.no_kwork else lambda l: fetch_kwork(l, args.full))):
-        if fn is None:
-            continue
+    for name, fn in all_sources(load_settings(), full=args.full, kwork=not args.no_kwork):
         try:
             orders = fn(log)
         except Exception as e:  # один упавший источник не должен ронять остальные

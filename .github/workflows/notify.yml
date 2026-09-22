@@ -1,7 +1,8 @@
 name: notify
 
 # Каждые 10 минут: собрать новые заказы и прислать подходящие в Telegram.
-# База market.db между запусками живёт в кэше Actions; раз в 6 часов снимок коммитится в репозиторий.
+# База market.db между запусками живёт в кэше Actions. В репозиторий она коммитится раз в 6 часов
+# и сразу после команд или оценок 👍/👎 из Telegram (вместе с settings.json).
 on:
   schedule:
     - cron: '*/10 * * * *'
@@ -39,16 +40,17 @@ jobs:
           path: market.db
           key: market-db-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Снимок базы в репозиторий (раз в 6 часов)
+      - name: Сохранить в репозиторий (после команд и оценок из Telegram или раз в 6 часов)
         run: |
           last=$(git log -1 --format=%ct -- market.db || echo 0)
-          if [ "${{ github.event_name }}" = "schedule" ] && [ $(( $(date +%s) - ${last:-0} )) -lt 21600 ]; then
-            echo "последний снимок моложе 6 часов"; exit 0
+          if [ ! -f .changed ] && [ "${{ github.event_name }}" = "schedule" ] \
+             && [ $(( $(date +%s) - ${last:-0} )) -lt 21600 ]; then
+            echo "нечего сохранять"; exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add market.db
+          git add market.db settings.json
           [ -f kwork_categories.json ] && git add kwork_categories.json
           git diff --cached --quiet && exit 0
-          git commit -m "data: снимок базы заказов"
+          git commit -m "data: база заказов и настройки"
           git pull --rebase -X theirs && git push
