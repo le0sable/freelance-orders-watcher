@@ -250,7 +250,8 @@ def parse_created(o):
         except ValueError:
             pass
     try:
-        return datetime.datetime.fromisoformat(raw)
+        dt = datetime.datetime.fromisoformat(raw)
+        return dt if dt.tzinfo else dt.replace(tzinfo=MSK)
     except ValueError:
         pass
     try:
@@ -541,11 +542,21 @@ def setup(token):
     print(f"Готово, chat_id={cfg['chat_id']}. Тестовое сообщение отправлено.")
 
 
+# Kwork держит в ленте открытыми и заказы многолетней давности. Сборщик находит их в глубине
+# ленты впервые, и они выглядят новыми: присылаем только опубликованные недавно.
+MAX_AGE = datetime.timedelta(days=3)
+
+
+def too_old(o):
+    dt = parse_created(o)
+    return dt is not None and datetime.datetime.now(datetime.timezone.utc) - dt > MAX_AGE
+
+
 def notify_orders(cfg, orders, settings, scorer):
     sent = 0
     for o in orders:
         niches = classify(o, settings)
-        if not niches or buyer_check(o, settings)[0] == 'ghost':
+        if not niches or too_old(o) or buyer_check(o, settings)[0] == 'ghost':
             continue
         score = scorer.score(o) if niches != ['★'] else None
         hide = settings.get('hide_below_score') or 0
