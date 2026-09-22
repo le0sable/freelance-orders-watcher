@@ -1,0 +1,4 @@
+tg.json
+*.log
+__pycache__/
+local.freelance-notify.plist
