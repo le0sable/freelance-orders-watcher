@@ -26,6 +26,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -133,7 +134,8 @@ def classify(order, settings=None):
     """Возвращает список ниш заказа (пустой, если не подходит).
 
     Порядок: белый список слов → всегда присылать; чёрный список и общие исключения →
-    не присылать; дальше ниши по словам и рубрикам, минимальный бюджет, выключенные ниши.
+    не присылать; минимальный бюджет и максимум откликов; дальше ниши по словам и рубрикам,
+    выключенные ниши.
     """
     settings = settings or {}
     title = order.get('title') or ''
@@ -148,6 +150,9 @@ def classify(order, settings=None):
         return []
     min_price = settings.get('min_price') or 0
     if order.get('price') and order['price'] < min_price:
+        return []
+    max_resp = settings.get('max_responses') or 0
+    if max_resp and order.get('responses') is not None and order['responses'] > max_resp:
         return []
     found = []
     for name, (strong, weak, excl, title_only) in NICHE_RE.items():
@@ -363,6 +368,7 @@ HELP = """Команды:
 /allow слово — присылать всегда, даже вне ниш
 /unallow слово — убрать из белого списка
 /minprice 3000 — не присылать заказы дешевле (0 — выключить)
+/maxresp 10 — не присылать заказы, где откликов больше 10 (0 — выключить)
 /hide 20 — прятать заказы с оценкой 🎯 ниже 20% (0 — выключить)
 /ghosts 3 — прятать заказчиков Kwork, которые закрыли 3+ проекта и никого не наняли (0 — выключить)
 /off Данные, /on Данные — выключить или включить нишу
@@ -371,8 +377,8 @@ HELP = """Команды:
 /stats — сколько оценок 👍/👎 и заказов по нишам
 
 Кнопки 👍/👎 под заказами учат оценку 🎯: после 10 👍 и 10 👎 она появится в сообщениях.
-Бот отвечает сразу, пока идёт очередной запуск на GitHub, и с задержкой до 10–20 минут,
-если запуск ещё не начался."""
+👎 ещё и убирает заказ из чата.
+Бот отвечает сразу, кроме минуты между запусками на GitHub."""
 
 
 def _rules_text(settings):
@@ -381,6 +387,7 @@ def _rules_text(settings):
     return (f"Чёрный список: {fmt(settings.get('blacklist', []))}\n"
             f"Белый список: {fmt(settings.get('whitelist', []))}\n"
             f"Мин. бюджет: {settings.get('min_price') or 0} ₽\n"
+            f"Макс. откликов: {settings.get('max_responses') or 'без ограничения'}\n"
             f"Прятать при 🎯 ниже: {settings.get('hide_below_score') or 0}%\n"
             f"Прятать заказчиков без найма: {_ghosts_text(settings)}\n"
             f"Выключенные ниши: {fmt(settings.get('niches_off', []))}\n"
@@ -415,8 +422,9 @@ def handle_command(text, settings, con):
         key, add = lists[cmd]
         changed = _toggle(settings.setdefault(key, []), arg.lower(), add)
         return (f"{'Готово' if changed else 'Без изменений'}.\n\n{_rules_text(settings)}", changed)
-    if cmd in ('/minprice', '/hide', '/ghosts') and arg.isdigit():
-        key = {'/minprice': 'min_price', '/hide': 'hide_below_score', '/ghosts': 'ghost_min_closed'}[cmd]
+    if cmd in ('/minprice', '/maxresp', '/hide', '/ghosts') and arg.isdigit():
+        key = {'/minprice': 'min_price', '/maxresp': 'max_responses', '/hide': 'hide_below_score',
+               '/ghosts': 'ghost_min_closed'}[cmd]
         settings[key] = int(arg)
         return (f'Готово.\n\n{_rules_text(settings)}', True)
     if cmd in ('/off', '/on') and arg:
@@ -439,17 +447,51 @@ def handle_command(text, settings, con):
     return (HELP, False)
 
 
+def _on_button(cfg, cb, con):
+    """Нажатие 👍/👎: записать оценку. 👎 удаляет сообщение из чата, 👍 меняет кнопки на «отмечено»."""
+    data = cb.get('data', '')
+    chat, message_id = cb['message']['chat']['id'], cb['message']['message_id']
+    if not data.startswith('fb:'):
+        tg(cfg, 'answerCallbackQuery', callback_query_id=cb['id'])
+        return False
+    _, label, key = data.split(':', 2)
+    source, oid = key.split(':', 1)
+    con.execute('insert or replace into feedback values (?,?,?,?)', (source, oid, int(label), collect.now()))
+    con.commit()  # не держать базу заблокированной, пока ждём ответов Telegram
+    mark = '👍 отмечено' if label == '1' else '👎 отмечено'
+    removed = False
+    if label != '1':
+        try:  # Telegram даёт удалять сообщения бота только первые 48 часов
+            tg(cfg, 'deleteMessage', chat_id=chat, message_id=message_id)
+            removed = True
+        except Exception:
+            pass
+    try:
+        tg(cfg, 'answerCallbackQuery', callback_query_id=cb['id'], text='👎 убрано' if removed else mark)
+    except Exception:
+        pass  # если ответить не успели (запрос устарел), это не страшно
+    if not removed:
+        try:
+            tg(cfg, 'editMessageReplyMarkup', chat_id=chat, message_id=message_id,
+               reply_markup=json.dumps({'inline_keyboard': [[{'text': mark, 'callback_data': 'noop'}]]}))
+        except Exception:
+            pass
+    return True
+
+
 def process_updates(cfg, settings, log, wait=0):
     """Забирает нажатия кнопок и команды (ждёт до wait секунд, если их нет).
     Возвращает True, если изменились настройки или оценки."""
-    con = sqlite3.connect(collect.DB)
+    con = sqlite3.connect(collect.DB, timeout=60)
     collect.ensure_schema(con)
     row = con.execute("select value from kv where key='tg_offset'").fetchone()
     offset = int(row[0]) if row else 0
     try:
         updates = tg(cfg, 'getUpdates', offset=offset, timeout=wait)['result']
     except Exception as e:
+        con.close()
         log(f'  telegram getUpdates: ошибка {e!r}')
+        time.sleep(5)  # чтобы при недоступном Telegram не крутиться вхолостую
         return False
     changed = False
     chat = str(cfg['chat_id'])
@@ -457,28 +499,17 @@ def process_updates(cfg, settings, log, wait=0):
         offset = u['update_id'] + 1
         cb = u.get('callback_query')
         msg = u.get('message')
-        if cb and str(cb['message']['chat']['id']) == chat and cb.get('data', '').startswith('fb:'):
-            _, label, key = cb['data'].split(':', 2)
-            source, oid = key.split(':', 1)
-            con.execute('insert or replace into feedback values (?,?,?,?)',
-                        (source, oid, int(label), collect.now()))
-            changed = True
-            mark = '👍 отмечено' if label == '1' else '👎 отмечено'
-            try:
-                tg(cfg, 'answerCallbackQuery', callback_query_id=cb['id'], text=mark)
-            except Exception:
-                pass  # если ответить не успели (запрос устарел), просто меняем кнопки
-            try:
-                tg(cfg, 'editMessageReplyMarkup', chat_id=chat, message_id=cb['message']['message_id'],
-                   reply_markup=json.dumps({'inline_keyboard': [[{'text': mark, 'callback_data': 'noop'}]]}))
-            except Exception:
-                pass
-        elif msg and str(msg['chat']['id']) == chat and msg.get('text', '').startswith('/'):
-            reply, settings_changed = handle_command(msg['text'], settings, con)
-            if settings_changed:
-                collect.save_settings(settings)
-                changed = True
-            send(cfg, html.escape(reply))
+        try:  # одно сломанное обновление не должно застревать в очереди и глушить остальные
+            if cb and str(cb.get('message', {}).get('chat', {}).get('id')) == chat:
+                changed |= _on_button(cfg, cb, con)
+            elif msg and str(msg['chat']['id']) == chat and msg.get('text', '').startswith('/'):
+                reply, settings_changed = handle_command(msg['text'], settings, con)
+                if settings_changed:
+                    collect.save_settings(settings)
+                    changed = True
+                send(cfg, html.escape(reply))
+        except Exception as e:
+            log(f'  telegram: не удалось обработать обновление {u.get("update_id")}: {e!r}')
     con.execute("insert or replace into kv values ('tg_offset', ?)", (str(offset),))
     con.commit()
     con.close()
@@ -561,25 +592,45 @@ def collect_pass(cfg, settings, log, silent=False):
 
 def run(cfg, duration=0, every=180):
     """Один проход, или (duration > 0) работа в течение duration секунд: площадки
-    опрашиваются раз в every секунд, а в паузах бот сразу отвечает на команды и кнопки."""
+    опрашиваются раз в every секунд, а команды и кнопки обрабатываются в отдельном потоке,
+    поэтому бот отвечает сразу, даже пока идёт долгий проход по Kwork."""
     log = lambda s: print(s, flush=True)  # noqa: E731
     log(f"=== {datetime.datetime.now():%Y-%m-%d %H:%M:%S} ===")
     # Без базы все заказы выглядят новыми: первый проход только наполняет её, без уведомлений
     silent = not os.path.exists(collect.DB)
     if silent:
         log('  базы нет — тихий проход, уведомления со следующего запуска')
+        collect.save([])  # создать базу, чтобы поток с командами было куда писать
     settings = collect.load_settings()
-    changed = process_updates(cfg, settings, log)
-    collect_pass(cfg, settings, log, silent)
-    deadline = time.time() + duration
-    next_pass = time.time() + every
-    while time.time() < deadline - 5:
-        wait = int(max(1, min(25, next_pass - time.time(), deadline - time.time() - 5)))
-        changed |= process_updates(cfg, settings, log, wait=wait)
-        if time.time() >= next_pass and time.time() < deadline - 60:
-            log(f"--- {datetime.datetime.now():%H:%M:%S} ---")
-            collect_pass(cfg, settings, log)
+    if not duration:
+        changed = process_updates(cfg, settings, log)
+        collect_pass(cfg, settings, log, silent)
+    else:
+        deadline = time.time() + duration
+        state = {'changed': False}
+
+        def poll():
+            # getUpdates может ждать только один клиент, поэтому команды забирает только этот поток
+            while time.time() < deadline - 5:
+                wait = int(max(1, min(25, deadline - time.time() - 5)))
+                try:
+                    state['changed'] |= process_updates(cfg, settings, log, wait=wait)
+                except Exception as e:
+                    log(f'  telegram: ошибка {e!r}')
+                    time.sleep(5)
+
+        poller = threading.Thread(target=poll, daemon=True)
+        poller.start()
+        while True:
+            collect_pass(cfg, settings, log, silent)
+            silent = False
             next_pass = time.time() + every
+            if next_pass >= deadline - 60:
+                break
+            time.sleep(next_pass - time.time())
+            log(f"--- {datetime.datetime.now():%H:%M:%S} ---")
+        poller.join()
+        changed = state['changed']
     if changed:
         # сигнал для GitHub Actions: закоммитить настройки и базу с оценками
         open(os.path.join(HERE, '.changed'), 'w').close()

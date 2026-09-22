@@ -1,7 +1,9 @@
 name: notify
 
-# Каждые 10 минут запуск на ~9 минут: площадки опрашиваются раз в 3 минуты, а бот сразу
-# отвечает на команды и кнопки. Следующий запуск ждёт в очереди, пока идёт текущий.
+# Запуск на ~9 минут: площадки опрашиваются раз в 3 минуты, а бот сразу отвечает на команды
+# и кнопки. В конце запуск сам ставит следующий (workflow_dispatch), и тот ждёт в очереди, пока
+# текущий не закончится. Расписание — только запасной вариант, чтобы цепочка восстановилась
+# после сбоя: GitHub выполняет cron с опозданием на часы.
 # База market.db между запусками живёт в кэше Actions. В репозиторий она коммитится раз в 6 часов
 # и сразу после команд или оценок 👍/👎 из Telegram (вместе с settings.json).
 on:
@@ -15,6 +17,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write  # чтобы запустить следующий запуск
 
 jobs:
   run:
@@ -32,6 +35,7 @@ jobs:
           restore-keys: market-db-
 
       - name: Собрать заказы и отправить уведомления
+        id: bot
         run: python3 notify.py --loop 540
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
@@ -45,11 +49,19 @@ jobs:
             kwork_categories.json
           key: market-db-${{ github.run_id }}-${{ github.run_attempt }}
 
+      # До коммита, чтобы сбой git push не рвал цепочку. После ошибки бота цепочку не продолжаем,
+      # иначе упавший код перезапускался бы без остановки; её поднимет расписание.
+      - name: Поставить следующий запуск
+        if: always() && steps.bot.outcome == 'success'
+        run: gh workflow run notify.yml --ref "${{ github.ref_name }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Сохранить в репозиторий (после команд и оценок из Telegram или раз в 6 часов)
         run: |
           last=$(git log -1 --format=%ct -- market.db || echo 0)
-          if [ ! -f .changed ] && [ "${{ github.event_name }}" = "schedule" ] \
-             && [ $(( $(date +%s) - ${last:-0} )) -lt 21600 ]; then
+          # запуски теперь почти все workflow_dispatch, поэтому тип события не проверяем
+          if [ ! -f .changed ] && [ $(( $(date +%s) - ${last:-0} )) -lt 21600 ]; then
             echo "нечего сохранять"; exit 0
           fi
           git config user.name "github-actions[bot]"

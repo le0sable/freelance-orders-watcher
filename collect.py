@@ -264,7 +264,7 @@ def all_sources(settings, full=False, kwork=True):
 def save(orders):
     """Пишет заказы в базу. Возвращает (список новых заказов, всего в базе)."""
     ts = now()
-    con = sqlite3.connect(DB)
+    con = sqlite3.connect(DB, timeout=60)  # бот в notify.py пишет оценки из соседнего потока
     ensure_schema(con)
     new = []
     buyer_set = ', '.join(f'{c}=coalesce(?, {c})' for c in BUYER_FIELDS)
