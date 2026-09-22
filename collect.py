@@ -45,6 +45,7 @@ create table if not exists orders (
     category text, price real, price_max real, days integer,
     created text, expires text, buyer_orders integer, buyer_hired_pct integer,
     responses integer, views integer, first_seen text, last_seen text,
+    buyer_id text, buyer_active integer, buyer_purchases integer,
     primary key (source, id)
 );
 create table if not exists snapshots (
@@ -55,6 +56,23 @@ create table if not exists feedback (
 );
 create table if not exists kv (key text primary key, value text);
 """
+
+
+# Колонки, добавленные после первой версии базы: в старой базе их создаёт ensure_schema
+ADDED_COLUMNS = {'buyer_id': 'text', 'buyer_active': 'integer', 'buyer_purchases': 'integer'}
+ORDER_COLUMNS = ('source', 'id', 'url', 'title', 'description', 'category', 'price', 'price_max', 'days',
+                 'created', 'expires', 'buyer_orders', 'buyer_hired_pct', 'responses', 'views',
+                 'first_seen', 'last_seen', *ADDED_COLUMNS)
+# Сведения о заказчике, которые меняются со временем: обновляем при каждой встрече заказа
+BUYER_FIELDS = ('buyer_orders', 'buyer_hired_pct', 'buyer_active', 'buyer_purchases')
+
+
+def ensure_schema(con):
+    con.executescript(SCHEMA)
+    have = {r[1] for r in con.execute('pragma table_info(orders)')}
+    for name, kind in ADDED_COLUMNS.items():
+        if name not in have:
+            con.execute(f'alter table orders add column {name} {kind}')
 
 
 def load_settings():
@@ -108,6 +126,17 @@ def known_ids(source):
     return ids
 
 
+def kwork_purchases(user):
+    """Сколько покупок у заказчика в каталоге Kwork (нижняя граница по значкам), 0 — ни одного значка."""
+    n = 0
+    for b in user.get('badges') or []:
+        badge = b.get('badge') or {}
+        m = re.search(r'(?:более|не менее) (\d+) покуп|(\d+) покупки', f"{badge.get('title')} {badge.get('description')}")
+        if m:
+            n = max(n, int(m.group(1) or m.group(2)))
+    return n
+
+
 def fetch_kwork(log, full=False):
     """Лента отсортирована от новых к старым: без --full идём, пока на странице
     есть незнакомые заказы (плюс 2 страницы для снимков откликов)."""
@@ -139,7 +168,8 @@ def fetch_kwork(log, full=False):
         retried = False
         last = (data.get('pagination') or {}).get('last_page') or page
         for w in data.get('wants') or []:
-            buyer = ((w.get('user') or {}).get('data')) or {}
+            user = w.get('user') or {}
+            buyer = user.get('data') or {}
             orders.append({
                 'source': 'kwork', 'id': str(w['id']),
                 'url': f"https://kwork.ru/projects/{w['id']}",
@@ -151,6 +181,9 @@ def fetch_kwork(log, full=False):
                 'created': w.get('date_create'), 'expires': w.get('date_expire'),
                 'buyer_orders': to_int(buyer.get('wants_count')),
                 'buyer_hired_pct': to_int(buyer.get('wants_hired_percent')),
+                'buyer_id': str(user['USERID']) if user.get('USERID') else None,
+                'buyer_active': to_int(w.get('getWantsActiveCount')),
+                'buyer_purchases': kwork_purchases(user),
                 'responses': to_int(w.get('kwork_count')),
                 'views': to_int(w.get('views_dirty')),
             })
@@ -232,22 +265,20 @@ def save(orders):
     """Пишет заказы в базу. Возвращает (список новых заказов, всего в базе)."""
     ts = now()
     con = sqlite3.connect(DB)
-    con.executescript(SCHEMA)
+    ensure_schema(con)
     new = []
+    buyer_set = ', '.join(f'{c}=coalesce(?, {c})' for c in BUYER_FIELDS)
     for o in orders:
         cur = con.execute(
-            'update orders set last_seen=?, responses=coalesce(?, responses), '
-            'views=coalesce(?, views) where source=? and id=?',
-            (ts, o.get('responses'), o.get('views'), o['source'], o['id']))
+            f'update orders set last_seen=?, responses=coalesce(?, responses), '
+            f'views=coalesce(?, views), {buyer_set} where source=? and id=?',
+            (ts, o.get('responses'), o.get('views'), *(o.get(c) for c in BUYER_FIELDS), o['source'], o['id']))
         if cur.rowcount == 0:
             new.append(o)
-            con.execute(
-                'insert into orders values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                (o['source'], o['id'], o['url'], o.get('title'), o.get('description'),
-                 o.get('category'), o.get('price'), o.get('price_max'), o.get('days'),
-                 o.get('created') or o.get('date'), o.get('expires'),
-                 o.get('buyer_orders'), o.get('buyer_hired_pct'),
-                 o.get('responses'), o.get('views'), ts, ts))
+            row = {**o, 'created': o.get('created') or o.get('date'), 'first_seen': ts, 'last_seen': ts}
+            con.execute(f"insert into orders ({', '.join(ORDER_COLUMNS)}) "
+                        f"values ({', '.join('?' * len(ORDER_COLUMNS))})",
+                        [row.get(c) for c in ORDER_COLUMNS])
         if o.get('responses') is not None or o.get('views') is not None:
             con.execute('insert into snapshots values (?,?,?,?,?)',
                         (o['source'], o['id'], ts, o.get('responses'), o.get('views')))

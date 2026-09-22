@@ -163,6 +163,35 @@ def classify(order, settings=None):
     return [n for n in found if n.lower() not in off]
 
 
+# ---------- заказчики, которые никого не нанимают ----------
+
+GHOST_MIN_CLOSED = 3  # по умолчанию; в settings.json — ghost_min_closed, 0 выключает фильтр
+
+
+def buyer_check(o, settings=None):
+    """(вид, пометка) по статистике заказчика Kwork. Вид: 'ghost' — закрыл не меньше
+    ghost_min_closed проектов и никого не нанял, покупок в каталоге меньше 3 (накрутка,
+    сбор откликов под курсы); 'new' — ещё ни одного закрытого проекта; None — обычный.
+
+    Kwork считает долю найма по всем проектам, включая ещё открытые. Поэтому новый заказчик,
+    выложивший сразу несколько заданий, тоже показывает «0%»: открытые проекты вычитаем."""
+    settings = settings or {}
+    total, pct = o.get('buyer_orders'), o.get('buyer_hired_pct')
+    if total is None or pct is None or pct > 0:
+        return None, ''
+    active = o.get('buyer_active')
+    closed = max(total - (active or 0), 0) if active is not None else None
+    bought = o.get('buyer_purchases') or 0
+    if closed is None:  # заказ собран до появления buyer_active: знаем только общее число
+        return (None, '🆕 новый заказчик') if total <= 2 else (None, f'⚠️ без найма: 0 из {total}')
+    if closed == 0:
+        return 'new', '🆕 новый заказчик'
+    limit = settings.get('ghost_min_closed', GHOST_MIN_CLOSED)
+    if bought < 3 and limit and closed >= limit:
+        return 'ghost', f'🚫 закрыто проектов: {closed}, никого не нанял'
+    return None, f'⚠️ закрыто без найма: {closed}'
+
+
 # ---------- оценка по твоим 👍/👎 (наивный Байес) ----------
 
 MIN_LABELS = 10  # столько 👍 и столько же 👎 нужно, чтобы оценка включилась
@@ -287,9 +316,14 @@ def format_order(o, niches, score=None):
 
     if o.get('buyer_orders') is not None:
         buyer = f"👤 заказчик: проектов {o['buyer_orders']}"
+        if o.get('buyer_active'):
+            buyer += f" (открыто {o['buyer_active']})"
         if o.get('buyer_hired_pct') is not None:
             buyer += f", нанимает в {o['buyer_hired_pct']}%"
-        lines.append(html.escape(buyer))
+        if o.get('buyer_purchases'):
+            buyer += f", покупок {o['buyer_purchases']}+"
+        note = buyer_check(o)[1]
+        lines.append(html.escape(buyer + (f' · {note}' if note else '')))
     if score is not None:
         lines.append(f'🎯 похоже на твои 👍: {round(score * 100)}%')
 
@@ -330,6 +364,7 @@ HELP = """Команды:
 /unallow слово — убрать из белого списка
 /minprice 3000 — не присылать заказы дешевле (0 — выключить)
 /hide 20 — прятать заказы с оценкой 🎯 ниже 20% (0 — выключить)
+/ghosts 3 — прятать заказчиков Kwork, которые закрыли 3+ проекта и никого не наняли (0 — выключить)
 /off Данные, /on Данные — выключить или включить нишу
 /channel add имя, /channel del имя — Telegram-каналы с заказами
 /rules — текущие настройки
@@ -347,9 +382,15 @@ def _rules_text(settings):
             f"Белый список: {fmt(settings.get('whitelist', []))}\n"
             f"Мин. бюджет: {settings.get('min_price') or 0} ₽\n"
             f"Прятать при 🎯 ниже: {settings.get('hide_below_score') or 0}%\n"
+            f"Прятать заказчиков без найма: {_ghosts_text(settings)}\n"
             f"Выключенные ниши: {fmt(settings.get('niches_off', []))}\n"
             f"Ниши: {', '.join(NICHES)}\n"
             f"Telegram-каналы: {fmt(['@' + c for c in settings.get('telegram_channels', [])])}")
+
+
+def _ghosts_text(settings):
+    limit = settings.get('ghost_min_closed', GHOST_MIN_CLOSED)
+    return f'от {limit} закрытых проектов' if limit else 'выключено'
 
 
 def _toggle(lst, value, add):
@@ -374,8 +415,8 @@ def handle_command(text, settings, con):
         key, add = lists[cmd]
         changed = _toggle(settings.setdefault(key, []), arg.lower(), add)
         return (f"{'Готово' if changed else 'Без изменений'}.\n\n{_rules_text(settings)}", changed)
-    if cmd in ('/minprice', '/hide') and arg.isdigit():
-        key = 'min_price' if cmd == '/minprice' else 'hide_below_score'
+    if cmd in ('/minprice', '/hide', '/ghosts') and arg.isdigit():
+        key = {'/minprice': 'min_price', '/hide': 'hide_below_score', '/ghosts': 'ghost_min_closed'}[cmd]
         settings[key] = int(arg)
         return (f'Готово.\n\n{_rules_text(settings)}', True)
     if cmd in ('/off', '/on') and arg:
@@ -402,7 +443,7 @@ def process_updates(cfg, settings, log, wait=0):
     """Забирает нажатия кнопок и команды (ждёт до wait секунд, если их нет).
     Возвращает True, если изменились настройки или оценки."""
     con = sqlite3.connect(collect.DB)
-    con.executescript(collect.SCHEMA)
+    collect.ensure_schema(con)
     row = con.execute("select value from kv where key='tg_offset'").fetchone()
     offset = int(row[0]) if row else 0
     try:
@@ -473,7 +514,7 @@ def notify_orders(cfg, orders, settings, scorer):
     sent = 0
     for o in orders:
         niches = classify(o, settings)
-        if not niches:
+        if not niches or buyer_check(o, settings)[0] == 'ghost':
             continue
         score = scorer.score(o) if niches != ['★'] else None
         hide = settings.get('hide_below_score') or 0
@@ -488,18 +529,18 @@ def notify_orders(cfg, orders, settings, scorer):
 def test(cfg, n):
     settings = collect.load_settings()
     con = sqlite3.connect(collect.DB)
-    con.executescript(collect.SCHEMA)
+    collect.ensure_schema(con)
     con.row_factory = sqlite3.Row
     orders = [dict(r) for r in con.execute('select * from orders order by first_seen desc, created desc')]
     scorer = Scorer(con)
-    picked = [o for o in orders if classify(o, settings)][:n]
+    picked = [o for o in orders if classify(o, settings) and buyer_check(o, settings)[0] != 'ghost'][:n]
     print(f'отправлено {notify_orders(cfg, picked, settings, scorer)}')
 
 
 def collect_pass(cfg, settings, log, silent=False):
     """Один проход по всем площадкам: сохранить новые заказы и прислать подходящие."""
     con = sqlite3.connect(collect.DB)
-    con.executescript(collect.SCHEMA)
+    collect.ensure_schema(con)
     known_sources = {r[0] for r in con.execute('select distinct source from orders')}
     scorer = Scorer(con)
     con.close()
