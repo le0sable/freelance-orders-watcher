@@ -9,5 +9,6 @@
     "devjobs",
     "cgfreelance",
     "freelancetaverna"
-  ]
+  ],
+  "max_responses": 20
 }
