@@ -4,11 +4,10 @@
   "min_price": 0,
   "hide_below_score": 0,
   "ghost_min_closed": 3,
-  "niches_off": [],
-  "telegram_channels": [
-    "devjobs",
-    "cgfreelance",
-    "freelancetaverna"
+  "niches_off": [
+    "3D",
+    "Приложения"
   ],
+  "telegram_channels": [],
   "max_responses": 20
 }
