@@ -6,7 +6,8 @@
   "ghost_min_closed": 3,
   "niches_off": [
     "3D",
-    "Приложения"
+    "Приложения",
+    "Маркетплейсы"
   ],
   "telegram_channels": [],
   "max_responses": 20
